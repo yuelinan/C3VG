@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
-import json
 import numpy as np
 class Sentence:
     def __init__(self, decoder_hidden, decoder_vocab,last_idx=2, sentence_idxes=[], sentence_scores=[]):
@@ -57,18 +56,11 @@ class EncRNN(nn.Module):
         self.embed.weight.requires_grad = True
         self.rnn = nn.GRU(embed_dim, hidden_dim, n_layers,batch_first=True,
                            bidirectional=use_birnn)
-        self.gru = nn.GRU(hidden_dim, hidden_dim, n_layers,batch_first=True,
-                           bidirectional=use_birnn)
         self.dropout = nn.Dropout(dout)
 
-    def forward(self, inputs, type = 'input'):
-        if type == 'input':
-            embs = self.dropout(self.embed(inputs))
-            enc_outs, hidden = self.rnn(embs)
-        else:
-            #print(inputs.size())
-            enc_outs, hidden = self.gru(inputs)
-        
+    def forward(self, inputs):
+        embs = self.dropout(self.embed(inputs))
+        enc_outs, hidden = self.rnn(embs)
         return self.dropout(enc_outs), hidden
 
 class Attention(nn.Module):
@@ -136,7 +128,7 @@ class DecRNN(nn.Module):
         self.dropout = nn.Dropout(dout)
 
     def forward(self, inputs, hidden, enc_outs):
-      
+        #inputs = inputs.unsqueeze(0)
         embs = self.dropout(self.embed(inputs))
         dec_out, hidden = self.rnn(embs, hidden)
         
@@ -144,33 +136,15 @@ class DecRNN(nn.Module):
         
         context = attn_weights.bmm(enc_outs) 
         concat_input = torch.cat((dec_out, context), -1) 
-        concat_output = torch.tanh(self.w(concat_input))
-        
+        concat_output_wo_tanh = self.w(concat_input)
+        concat_output = torch.tanh(concat_output_wo_tanh)
+        # st = tanh(Wc[ct;st])
         pred = self.prediction(concat_output)
 
-        return pred, hidden
-
-class Mask_Attention(nn.Module):
-    
-    def __init__(self):
-        super(Mask_Attention, self).__init__()
-
-    def forward(self, query, context):
-        
-        attention = torch.bmm(context, query.transpose(1, 2))
-        mask = attention.new(attention.size()).zero_()
-        mask[:,:,:] = -np.inf
-        attention_mask = torch.where(attention==0, mask, attention)
-        attention_mask = torch.nn.functional.softmax(attention_mask, dim=-1)
-        
-        mask_zero = attention.new(attention.size()).zero_()
-        final_attention = torch.where(attention_mask!=attention_mask, mask_zero, attention_mask)
-
-        context_vec = torch.bmm(final_attention, query)
-        return context_vec
+        return pred, hidden,concat_output_wo_tanh
 
 class Seq2seqAttn(nn.Module):
-    def __init__(self, src_vocab, tgt_vocab, device,process):
+    def __init__(self, src_vocab, tgt_vocab, device):
         super().__init__()        
         self.src_vsz = src_vocab
         self.tgt_vsz = tgt_vocab
@@ -180,43 +154,27 @@ class Seq2seqAttn(nn.Module):
         self.dropout = 0.1
         self.n_layers = 1
         self.attn = 'concat'
-        self.id2charge = json.load(open('id2charge.json','r'))
+
         self.encoder = EncRNN(self.src_vsz, self.embed_dim, self.hidden_dim, 
                               self.n_layers, self.bidirectional, self.dropout)
         self.decoder = DecRNN(self.tgt_vsz, self.embed_dim, self.hidden_dim, 
                               self.n_layers, self.bidirectional, self.dropout,
                               self.attn)
         self.device = device
-        self.process = process
         self.use_birnn = self.bidirectional
-        self.charge_class = 62
-        self.charge_pred = nn.Linear(self.hidden_dim,self.charge_class)
-        self.mask_attention = Mask_Attention()
 
     def forward(self, srcs, tgts=None, maxlen=150, tf_ratio=0.5,training=True):
-        
+        # slen, bsz = srcs.size()
+        # tlen = tgts.size(0) if isinstance(tgts, torch.Tensor) else maxlen
+        #dec_inputs = torch.ones_like(srcs[1]) * 2 # <eos> is mapped to id=2
         SOS_token = 2
         EOS_token = 1
         batch_size = srcs.size(0)  
-        
+        # 解码的长度
         target_len = tgts.size(1)
+
+        enc_outs, hidden = self.encoder(srcs)
         
-        enc_outs1, hidden1 = self.encoder(srcs)
-        charge_hidden = enc_outs1.mean(1)
-
-        charge_out = self.charge_pred(charge_hidden)
-        charge_pred = charge_out.cpu().argmax(dim=1).numpy()
-
-        charge_names = [self.id2charge[str(i)] for i in charge_pred]
-
-        legals = self.process.process_law(charge_names)
-        legals = legals.to(self.device)
-        legals,_ = self.encoder(legals)
-
-        charge_aware_hidden = self.mask_attention(legals,enc_outs1)
-        charge_aware_hidden += enc_outs1
-        enc_outs, hidden = self.encoder(charge_aware_hidden,type = 'noinput')
-
         dec_inputs = torch.LongTensor([[SOS_token for _ in range(batch_size)]])
         dec_inputs = dec_inputs.view(batch_size,1)
         dec_inputs = dec_inputs.to(self.device)
@@ -232,7 +190,7 @@ class Seq2seqAttn(nn.Module):
         
         if training:
             for i in range(target_len):
-                preds, hidden = self.decoder(dec_inputs, hidden, enc_outs)
+                preds, hidden,_ = self.decoder(dec_inputs, hidden, enc_outs)
                 outs.append(preds)
                 use_tf = random.random() < tf_ratio
                 preds = preds.squeeze(1)
@@ -240,39 +198,176 @@ class Seq2seqAttn(nn.Module):
                 dec_inputs = dec_inputs.unsqueeze(1)
                 
                 loss += F.cross_entropy(preds, tgts[:,i], ignore_index=EOS_token)
-            return torch.stack(outs), loss , charge_out
+            return torch.stack(outs), loss
         else:
-            beam_size = 1
-            if beam_size==1:
-                terminal_sentences, prev_top_sentences, next_top_sentences = [], [], []
-                decoder_hidden = hidden
-                with open('decoder_vocab.pickle', 'rb') as file:
-                    decoder_vocab=pickle.load(file)
-                prev_top_sentences.append(Sentence(decoder_hidden,decoder_vocab))
-                for i in range(maxlen):
-                    for sentence in prev_top_sentences:
-                        decoder_input = torch.LongTensor([[sentence.last_idx]])
-                        decoder_input = decoder_input.to(self.device)
-                        #print(decoder_input.size())
-                        decoder_hidden = sentence.decoder_hidden
+            beam_size = 5
 
-                        decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden, enc_outs)
+            terminal_sentences, prev_top_sentences, next_top_sentences = [], [], []
+            decoder_hidden = hidden
+            with open('./decoder_vocab.pickle', 'rb') as file:
+                decoder_vocab=pickle.load(file)
+            prev_top_sentences.append(Sentence(decoder_hidden,decoder_vocab))
+            for i in range(maxlen):
+                for sentence in prev_top_sentences:
+                    decoder_input = torch.LongTensor([[sentence.last_idx]])
+                    decoder_input = decoder_input.to(self.device)
 
-                        topv, topi = decoder_output.topk(beam_size)
-                        term, top = sentence.addTopk(topi, topv, decoder_hidden, beam_size,decoder_vocab)
-                        terminal_sentences.extend(term)
-                        next_top_sentences.extend(top)
+                    decoder_hidden = sentence.decoder_hidden
 
-                    next_top_sentences.sort(key=lambda s: s.avgScore(), reverse=True)
-                    prev_top_sentences = next_top_sentences[:beam_size]
-                    next_top_sentences = []
+                    decoder_output, decoder_hidden,_ = self.decoder(decoder_input, decoder_hidden, enc_outs)
 
-                terminal_sentences += [sentence.toWordScore() for sentence in prev_top_sentences]
-                terminal_sentences.sort(key=lambda x: x[1], reverse=True)
+                    topv, topi = decoder_output.topk(beam_size)
+                    term, top = sentence.addTopk(topi, topv, decoder_hidden, beam_size,decoder_vocab)
+                    terminal_sentences.extend(term)
+                    next_top_sentences.extend(top)
 
-                n = min(len(terminal_sentences), 15)
-            else:
-                terminal_sentences = [1,2,3]
-                n=1
-            return terminal_sentences[:n], charge_out
+                next_top_sentences.sort(key=lambda s: s.avgScore(), reverse=True)
+                prev_top_sentences = next_top_sentences[:beam_size]
+                next_top_sentences = []
+
+            terminal_sentences += [sentence.toWordScore() for sentence in prev_top_sentences]
+            terminal_sentences.sort(key=lambda x: x[1], reverse=True)
+
+            n = min(len(terminal_sentences), 15)
+            
+            return terminal_sentences[:1]
+
+
+class ADC_Gen(nn.Module):
+    def __init__(self, src_vocab, tgt_vocab, device):
+        super().__init__()        
+        self.src_vsz = src_vocab
+        self.tgt_vsz = tgt_vocab
+        self.embed_dim = 200
+        self.hidden_dim = 150
+        self.bidirectional = False
+        self.dropout = 0.1
+        self.n_layers = 1
+        self.attn = 'concat'
+
+        self.encoder = EncRNN(self.src_vsz, self.embed_dim, self.hidden_dim, 
+                              self.n_layers, self.bidirectional, self.dropout)
+        self.decoder = DecRNN(self.tgt_vsz, self.embed_dim, self.hidden_dim, 
+                              self.n_layers, self.bidirectional, self.dropout,
+                              self.attn)
+        self.device = device
+        self.use_birnn = self.bidirectional
+        self.charge_pred = nn.Linear(self.hidden_dim*2,62)
+
+
+    def forward(self, srcs, tgts=None, maxlen=150, tf_ratio=0.5,training=True):
+        # slen, bsz = srcs.size()
+        # tlen = tgts.size(0) if isinstance(tgts, torch.Tensor) else maxlen
+        #dec_inputs = torch.ones_like(srcs[1]) * 2 # <eos> is mapped to id=2
+        SOS_token = 2
+        EOS_token = 1
+        batch_size = srcs.size(0)  
+        # 解码的长度
+        target_len = tgts.size(1)
+
+        enc_outs, hidden = self.encoder(srcs)
         
+        dec_inputs = torch.LongTensor([[SOS_token for _ in range(batch_size)]])
+        dec_inputs = dec_inputs.view(batch_size,1)
+        dec_inputs = dec_inputs.to(self.device)
+        
+        outs = []
+        loss = 0
+        if self.use_birnn:
+            def trans_hidden(hs):
+                hs = hs.view(self.n_layers, 2, batch_size, self.hidden_dim)
+                hs = torch.stack([torch.cat((h[0], h[1]), 1) for h in hs])
+                return hs
+            hidden = tuple(trans_hidden(hs) for hs in hidden)
+        gen_out = []
+        if training:
+            for i in range(target_len):
+                preds, hidden,concat_output = self.decoder(dec_inputs, hidden, enc_outs)
+                
+                gen_out.append(concat_output.squeeze(1))
+                outs.append(preds)
+                use_tf = random.random() < tf_ratio
+                preds = preds.squeeze(1)
+                dec_inputs = tgts[:,i] if use_tf else preds.max(1)[1]
+                dec_inputs = dec_inputs.unsqueeze(1)
+                
+                loss += F.cross_entropy(preds, tgts[:,i], ignore_index=EOS_token)
+            
+            dec_outs = torch.stack(gen_out,1)
+            dec_outs = dec_outs.mean(1)
+            enc_outs = enc_outs.mean(1)
+
+            charge_hidden = torch.cat([enc_outs,dec_outs],-1)
+            charge_out = self.charge_pred(charge_hidden)
+            return torch.stack(outs), loss,charge_out
+        else:
+            beam_size = 5
+            terminal_sentences, prev_top_sentences, next_top_sentences = [], [], []
+            decoder_hidden = hidden
+            with open('./decoder_vocab.pickle', 'rb') as file:
+                decoder_vocab=pickle.load(file)
+            prev_top_sentences.append(Sentence(decoder_hidden,decoder_vocab))
+            gen_out = []
+            for i in range(maxlen):
+                for sentence in prev_top_sentences:
+                    decoder_input = torch.LongTensor([[sentence.last_idx]])
+                    decoder_input = decoder_input.to(self.device)
+
+                    decoder_hidden = sentence.decoder_hidden
+
+                    decoder_output, decoder_hidden,concat_output = self.decoder(decoder_input, decoder_hidden, enc_outs)
+                    gen_out.append(concat_output.squeeze(1))
+
+                    topv, topi = decoder_output.topk(beam_size)
+                    term, top = sentence.addTopk(topi, topv, decoder_hidden, beam_size,decoder_vocab)
+                    terminal_sentences.extend(term)
+                    next_top_sentences.extend(top)
+
+                next_top_sentences.sort(key=lambda s: s.avgScore(), reverse=True)
+                prev_top_sentences = next_top_sentences[:beam_size]
+                next_top_sentences = []
+
+            terminal_sentences += [sentence.toWordScore() for sentence in prev_top_sentences]
+            terminal_sentences.sort(key=lambda x: x[1], reverse=True)
+
+            n = min(len(terminal_sentences), 15)
+
+            dec_outs = torch.stack(gen_out,1)
+            dec_outs = dec_outs.mean(1)
+            enc_outs = enc_outs.mean(1)
+
+            charge_hidden = torch.cat([enc_outs,dec_outs],-1)
+            charge_out = self.charge_pred(charge_hidden)
+
+            return terminal_sentences[:1],charge_out
+
+
+
+class Gen(nn.Module):
+    def __init__(self,device,src_vocab, tgt_vocab,use_birnn=True):
+        super(Gen, self).__init__()
+        self.embed_dim = 200
+        self.hidden_dim = 150    
+        self.device = device
+        self.embed = nn.Embedding(src_vocab, self.embed_dim)
+        self.embed.weight.requires_grad = True
+
+        self.sc_gen = Seq2seqAttn(src_vocab, tgt_vocab, self.device)
+        self.adc_gen = ADC_Gen(src_vocab, tgt_vocab, self.device)
+
+    def forward(self, sc_source,adc_source,sc_target,adc_target,training=True):
+        # 默认batch为1
+        if training:
+            out1,loss_sc = self.sc_gen(sc_source,sc_target)
+            out2,loss_adc,charge_out = self.adc_gen(adc_source,adc_target)
+            return loss_sc,loss_adc,charge_out
+        else:
+            out1 = self.sc_gen(sc_source,sc_target,training = training)
+            out2,charge_out = self.adc_gen(adc_source,adc_target,training = training)
+            return out1,out2,charge_out
+
+            
+        
+
+
+
